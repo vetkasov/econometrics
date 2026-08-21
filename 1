@@ -16,7 +16,6 @@ BEGIN
 
     SET NOCOUNT ON;
 
-
     IF @vdate IS NULL
     BEGIN
         SELECT
@@ -25,6 +24,10 @@ BEGIN
         WHERE [version] = @source_version;
     END;
 
+    IF @vdate IS NULL
+    BEGIN
+        THROW 51000, 'Не удалось определить @vdate по @source_version', 1;
+    END;
 
     IF @random_pool_size IS NULL OR @random_pool_size < 1
         SET @random_pool_size = 1;
@@ -50,6 +53,12 @@ BEGIN
       AND d.[group_name] <> 'Прочие';
 
 
+    IF NOT EXISTS (SELECT 1 FROM #data_holders)
+    BEGIN
+        THROW 51001, 'По @source_version не найдены исходные данные', 1;
+    END;
+
+
     --===============================================================
     -- 2. Агрегируем исходник до group_name + isin
     --===============================================================
@@ -68,7 +77,6 @@ BEGIN
          dh.[isin]
         ,dh.[group_name];
 
-
     CREATE INDEX ix_raw_holders
     ON #raw_holders ([group_name], [isin]);
 
@@ -83,7 +91,6 @@ BEGIN
         rh.[group_name]
     INTO #groups
     FROM #raw_holders rh;
-
 
     CREATE UNIQUE CLUSTERED INDEX ix_groups
     ON #groups ([group_name]);
@@ -167,7 +174,7 @@ BEGIN
         WHERE [limit_rub] IS NULL
     )
     BEGIN
-        THROW 51001, 'Для части ISIN не найден лимит в repo_banks_for_vla_limits', 1;
+        THROW 51002, 'Для части ISIN не найден лимит в repo_banks_for_vla_limits', 1;
     END;
 
 
@@ -175,4 +182,881 @@ BEGIN
     ON #isins ([isin]);
 
 
-   
+    --===============================================================
+    -- 5. Полная матрица group_name × isin
+    --
+    -- Это основное состояние алгоритма.
+    -- После каждой сделки amount_rub обновляется именно здесь.
+    --===============================================================
+
+    DROP TABLE IF EXISTS #state;
+
+    SELECT
+         g.[group_name]
+        ,i.[isin]
+        ,i.[base_isin]
+        ,ISNULL(rh.[amount_rub], 0) AS [amount_rub]
+        ,i.[issuesize_rub]
+        ,i.[limit_share]
+        ,i.[limit_rub]
+    INTO #state
+    FROM #groups g
+
+    CROSS JOIN #isins i
+
+    LEFT JOIN #raw_holders rh
+        ON rh.[group_name] = g.[group_name]
+       AND rh.[isin] = i.[isin];
+
+    CREATE UNIQUE CLUSTERED INDEX ix_state
+    ON #state ([group_name], [isin]);
+
+
+    --===============================================================
+    -- 6. Таблица результата
+    --===============================================================
+
+    DROP TABLE IF EXISTS #result_deals;
+
+    CREATE TABLE #result_deals
+    (
+         [id]        INT             NOT NULL
+        ,[part]      INT             NOT NULL
+        ,[isin]      VARCHAR(255)    NOT NULL
+        ,[bank_from] VARCHAR(255)    NOT NULL
+        ,[qty_from]  DECIMAL(38,4)   NOT NULL
+        ,[bank_to]   VARCHAR(255)    NOT NULL
+        ,[qty_to]    DECIMAL(38,4)   NOT NULL
+        ,[version]   VARCHAR(25)     NOT NULL
+    );
+
+    CREATE INDEX ix_result_deals
+    ON #result_deals ([bank_from], [isin]);
+
+
+    --===============================================================
+    -- 7. Основной цикл
+    --===============================================================
+
+    DECLARE
+         @iter          INT = 0
+        ,@deal_id       INT = 0
+        ,@bank_from     VARCHAR(255)
+        ,@bank_to       VARCHAR(255)
+        ,@trade_size    DECIMAL(38,4)
+        ,@sum_leg1      DECIMAL(38,4)
+        ,@sum_leg2      DECIMAL(38,4);
+
+
+    WHILE @iter < @max_iter
+    BEGIN
+
+        SET @iter = @iter + 1;
+
+        DROP TABLE IF EXISTS #pair_candidate;
+
+
+        --===========================================================
+        -- 7.1. Выбор пары групп
+        --
+        -- Пара выбирается по score, который учитывает:
+        -- 1. размер возможного обмена;
+        -- 2. потенциальное закрытие перелимитных строк;
+        -- 3. прирост ВЛА от перехода amount > limit к amount <= limit.
+        --
+        -- Рандом:
+        -- TOP (@random_pool_size) лучших пар по score,
+        -- затем случайный выбор одной из них через ORDER BY NEWID().
+        -- Если @random_pool_size = 1, версия почти детерминированная.
+        --===========================================================
+
+        ;WITH pair_calc AS
+        (
+            SELECT
+                 a.[group_name] AS [group_a]
+                ,b.[group_name] AS [group_b]
+
+                ,SUM(
+                    CASE
+                        WHEN a.[amount_rub] > a.[limit_rub] + @eps
+                         AND b.[amount_rub] < b.[limit_rub] - @eps
+                        THEN
+                            CASE
+                                WHEN a.[amount_rub] - a.[limit_rub] < b.[limit_rub] - b.[amount_rub]
+                                    THEN a.[amount_rub] - a.[limit_rub]
+                                ELSE b.[limit_rub] - b.[amount_rub]
+                            END
+                        ELSE 0
+                    END
+                 ) AS [can_a_to_b]
+
+                ,SUM(
+                    CASE
+                        WHEN b.[amount_rub] > b.[limit_rub] + @eps
+                         AND a.[amount_rub] < a.[limit_rub] - @eps
+                        THEN
+                            CASE
+                                WHEN b.[amount_rub] - b.[limit_rub] < a.[limit_rub] - a.[amount_rub]
+                                    THEN b.[amount_rub] - b.[limit_rub]
+                                ELSE a.[limit_rub] - a.[amount_rub]
+                            END
+                        ELSE 0
+                    END
+                 ) AS [can_b_to_a]
+
+                ,SUM(
+                    CASE
+                        WHEN a.[amount_rub] > a.[limit_rub] + @eps
+                         AND b.[amount_rub] < b.[limit_rub] - @eps
+                        THEN
+                            CASE
+                                WHEN a.[amount_rub] - a.[limit_rub] < b.[limit_rub] - b.[amount_rub]
+                                    THEN a.[amount_rub] - a.[limit_rub]
+                                ELSE b.[limit_rub] - b.[amount_rub]
+                            END
+
+                            +
+
+                            CASE
+                                WHEN b.[limit_rub] - b.[amount_rub] >= a.[amount_rub] - a.[limit_rub]
+                                    THEN a.[limit_rub]
+                                ELSE 0
+                            END
+                        ELSE 0
+                    END
+                 ) AS [score_a_to_b]
+
+                ,SUM(
+                    CASE
+                        WHEN b.[amount_rub] > b.[limit_rub] + @eps
+                         AND a.[amount_rub] < a.[limit_rub] - @eps
+                        THEN
+                            CASE
+                                WHEN b.[amount_rub] - b.[limit_rub] < a.[limit_rub] - a.[amount_rub]
+                                    THEN b.[amount_rub] - b.[limit_rub]
+                                ELSE a.[limit_rub] - a.[amount_rub]
+                            END
+
+                            +
+
+                            CASE
+                                WHEN a.[limit_rub] - a.[amount_rub] >= b.[amount_rub] - b.[limit_rub]
+                                    THEN b.[limit_rub]
+                                ELSE 0
+                            END
+                        ELSE 0
+                    END
+                 ) AS [score_b_to_a]
+
+            FROM #state a
+
+            JOIN #state b
+                ON a.[isin] = b.[isin]
+               AND a.[group_name] < b.[group_name]
+
+            GROUP BY
+                 a.[group_name]
+                ,b.[group_name]
+        ),
+        pair_ready AS
+        (
+            SELECT
+                 pc.[group_a]
+                ,pc.[group_b]
+                ,pc.[can_a_to_b]
+                ,pc.[can_b_to_a]
+                ,pc.[score_a_to_b]
+                ,pc.[score_b_to_a]
+
+                ,CASE
+                    WHEN pc.[can_a_to_b] < pc.[can_b_to_a]
+                        THEN pc.[can_a_to_b]
+                    ELSE pc.[can_b_to_a]
+                 END AS [trade_size]
+
+                ,pc.[score_a_to_b] + pc.[score_b_to_a] AS [pair_score]
+
+            FROM pair_calc pc
+            WHERE pc.[can_a_to_b] > @eps
+              AND pc.[can_b_to_a] > @eps
+        ),
+        top_pool AS
+        (
+            SELECT TOP (@random_pool_size)
+                 pr.*
+            FROM pair_ready pr
+            WHERE pr.[trade_size] > @eps
+            ORDER BY
+                 pr.[pair_score] DESC
+                ,pr.[trade_size] DESC
+                ,pr.[can_a_to_b] + pr.[can_b_to_a] DESC
+        )
+        SELECT TOP (1)
+             tp.*
+        INTO #pair_candidate
+        FROM top_pool tp
+        ORDER BY
+             NEWID();
+
+
+        IF NOT EXISTS (SELECT 1 FROM #pair_candidate)
+            BREAK;
+
+
+        SELECT
+             @bank_from =
+                CASE
+                    WHEN [score_a_to_b] >= [score_b_to_a]
+                        THEN [group_a]
+                    ELSE [group_b]
+                END
+
+            ,@bank_to =
+                CASE
+                    WHEN [score_a_to_b] >= [score_b_to_a]
+                        THEN [group_b]
+                    ELSE [group_a]
+                END
+
+            ,@trade_size = [trade_size]
+
+        FROM #pair_candidate;
+
+
+        IF @trade_size IS NULL OR @trade_size <= @eps
+            BREAK;
+
+
+        --===========================================================
+        -- 7.2. Корзина part = 1
+        --
+        -- Приоритет:
+        -- 1. можно полностью закрыть перелимит;
+        -- 2. высокая эффективность закрытия;
+        -- 3. большой потенциальный ВЛА-эффект;
+        -- 4. меньший sender_excess, потому что его проще дожать;
+        -- 5. уже передавалась ранее;
+        -- 6. большой available_rub.
+        --===========================================================
+
+        DROP TABLE IF EXISTS #leg1;
+
+        ;WITH available AS
+        (
+            SELECT
+                 s_from.[isin]
+                ,s_from.[group_name] AS [bank_from]
+                ,s_to.[group_name] AS [bank_to]
+
+                ,s_from.[amount_rub] AS [sender_amount]
+                ,s_to.[amount_rub] AS [receiver_amount]
+                ,s_from.[limit_rub]
+
+                ,s_from.[amount_rub] - s_from.[limit_rub] AS [sender_excess]
+                ,s_to.[limit_rub] - s_to.[amount_rub] AS [receiver_capacity]
+
+                ,CASE
+                    WHEN s_from.[amount_rub] - s_from.[limit_rub] < s_to.[limit_rub] - s_to.[amount_rub]
+                        THEN s_from.[amount_rub] - s_from.[limit_rub]
+                    ELSE s_to.[limit_rub] - s_to.[amount_rub]
+                 END AS [available_rub]
+
+                ,CASE
+                    WHEN s_to.[limit_rub] - s_to.[amount_rub] >= s_from.[amount_rub] - s_from.[limit_rub]
+                        THEN 1
+                    ELSE 0
+                 END AS [can_close_now]
+
+                ,CASE
+                    WHEN s_to.[limit_rub] - s_to.[amount_rub] >= s_from.[amount_rub] - s_from.[limit_rub]
+                        THEN s_from.[limit_rub]
+                    ELSE 0
+                 END AS [vla_gain_if_close]
+
+                ,CASE
+                    WHEN EXISTS
+                    (
+                        SELECT 1
+                        FROM #result_deals rd
+                        WHERE rd.[bank_from] = s_from.[group_name]
+                          AND rd.[isin] = s_from.[isin]
+                    )
+                    THEN 1
+                    ELSE 0
+                 END AS [was_already_given]
+
+            FROM #state s_from
+
+            JOIN #state s_to
+                ON s_to.[isin] = s_from.[isin]
+
+            WHERE s_from.[group_name] = @bank_from
+              AND s_to.[group_name] = @bank_to
+              AND s_from.[amount_rub] > s_from.[limit_rub] + @eps
+              AND s_to.[amount_rub] < s_to.[limit_rub] - @eps
+        ),
+        ordered AS
+        (
+            SELECT
+                 a.*
+
+                ,CASE
+                    WHEN a.[can_close_now] = 1
+                        THEN a.[vla_gain_if_close] / NULLIF(a.[sender_excess], 0)
+                    ELSE 0
+                 END AS [close_efficiency]
+
+            FROM available a
+            WHERE a.[available_rub] > @eps
+        ),
+        bucketed AS
+        (
+            SELECT
+                 o.*
+
+                ,SUM(o.[available_rub]) OVER
+                (
+                    ORDER BY
+                         o.[can_close_now] DESC
+                        ,o.[close_efficiency] DESC
+                        ,o.[vla_gain_if_close] DESC
+                        ,o.[sender_excess] ASC
+                        ,o.[was_already_given] DESC
+                        ,o.[available_rub] DESC
+                        ,o.[isin]
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                ) AS [cumulative_to]
+
+                ,SUM(o.[available_rub]) OVER
+                (
+                    ORDER BY
+                         o.[can_close_now] DESC
+                        ,o.[close_efficiency] DESC
+                        ,o.[vla_gain_if_close] DESC
+                        ,o.[sender_excess] ASC
+                        ,o.[was_already_given] DESC
+                        ,o.[available_rub] DESC
+                        ,o.[isin]
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                ) AS [cumulative_before]
+
+            FROM ordered o
+        )
+        SELECT
+             b.[isin]
+            ,b.[bank_from]
+            ,b.[bank_to]
+
+            ,CASE
+                WHEN ISNULL(b.[cumulative_before], 0) >= @trade_size
+                    THEN CAST(0 AS DECIMAL(38,4))
+
+                WHEN b.[cumulative_to] <= @trade_size
+                    THEN b.[available_rub]
+
+                ELSE @trade_size - ISNULL(b.[cumulative_before], 0)
+             END AS [qty]
+
+        INTO #leg1
+
+        FROM bucketed b
+        WHERE ISNULL(b.[cumulative_before], 0) < @trade_size;
+
+
+        DELETE FROM #leg1
+        WHERE [qty] <= @eps;
+
+
+        --===========================================================
+        -- 7.3. Корзина part = 2
+        --===========================================================
+
+        DROP TABLE IF EXISTS #leg2;
+
+        ;WITH available AS
+        (
+            SELECT
+                 s_from.[isin]
+                ,s_from.[group_name] AS [bank_from]
+                ,s_to.[group_name] AS [bank_to]
+
+                ,s_from.[amount_rub] AS [sender_amount]
+                ,s_to.[amount_rub] AS [receiver_amount]
+                ,s_from.[limit_rub]
+
+                ,s_from.[amount_rub] - s_from.[limit_rub] AS [sender_excess]
+                ,s_to.[limit_rub] - s_to.[amount_rub] AS [receiver_capacity]
+
+                ,CASE
+                    WHEN s_from.[amount_rub] - s_from.[limit_rub] < s_to.[limit_rub] - s_to.[amount_rub]
+                        THEN s_from.[amount_rub] - s_from.[limit_rub]
+                    ELSE s_to.[limit_rub] - s_to.[amount_rub]
+                 END AS [available_rub]
+
+                ,CASE
+                    WHEN s_to.[limit_rub] - s_to.[amount_rub] >= s_from.[amount_rub] - s_from.[limit_rub]
+                        THEN 1
+                    ELSE 0
+                 END AS [can_close_now]
+
+                ,CASE
+                    WHEN s_to.[limit_rub] - s_to.[amount_rub] >= s_from.[amount_rub] - s_from.[limit_rub]
+                        THEN s_from.[limit_rub]
+                    ELSE 0
+                 END AS [vla_gain_if_close]
+
+                ,CASE
+                    WHEN EXISTS
+                    (
+                        SELECT 1
+                        FROM #result_deals rd
+                        WHERE rd.[bank_from] = s_from.[group_name]
+                          AND rd.[isin] = s_from.[isin]
+                    )
+                    THEN 1
+                    ELSE 0
+                 END AS [was_already_given]
+
+            FROM #state s_from
+
+            JOIN #state s_to
+                ON s_to.[isin] = s_from.[isin]
+
+            WHERE s_from.[group_name] = @bank_to
+              AND s_to.[group_name] = @bank_from
+              AND s_from.[amount_rub] > s_from.[limit_rub] + @eps
+              AND s_to.[amount_rub] < s_to.[limit_rub] - @eps
+        ),
+        ordered AS
+        (
+            SELECT
+                 a.*
+
+                ,CASE
+                    WHEN a.[can_close_now] = 1
+                        THEN a.[vla_gain_if_close] / NULLIF(a.[sender_excess], 0)
+                    ELSE 0
+                 END AS [close_efficiency]
+
+            FROM available a
+            WHERE a.[available_rub] > @eps
+        ),
+        bucketed AS
+        (
+            SELECT
+                 o.*
+
+                ,SUM(o.[available_rub]) OVER
+                (
+                    ORDER BY
+                         o.[can_close_now] DESC
+                        ,o.[close_efficiency] DESC
+                        ,o.[vla_gain_if_close] DESC
+                        ,o.[sender_excess] ASC
+                        ,o.[was_already_given] DESC
+                        ,o.[available_rub] DESC
+                        ,o.[isin]
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                ) AS [cumulative_to]
+
+                ,SUM(o.[available_rub]) OVER
+                (
+                    ORDER BY
+                         o.[can_close_now] DESC
+                        ,o.[close_efficiency] DESC
+                        ,o.[vla_gain_if_close] DESC
+                        ,o.[sender_excess] ASC
+                        ,o.[was_already_given] DESC
+                        ,o.[available_rub] DESC
+                        ,o.[isin]
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                ) AS [cumulative_before]
+
+            FROM ordered o
+        )
+        SELECT
+             b.[isin]
+            ,b.[bank_from]
+            ,b.[bank_to]
+
+            ,CASE
+                WHEN ISNULL(b.[cumulative_before], 0) >= @trade_size
+                    THEN CAST(0 AS DECIMAL(38,4))
+
+                WHEN b.[cumulative_to] <= @trade_size
+                    THEN b.[available_rub]
+
+                ELSE @trade_size - ISNULL(b.[cumulative_before], 0)
+             END AS [qty]
+
+        INTO #leg2
+
+        FROM bucketed b
+        WHERE ISNULL(b.[cumulative_before], 0) < @trade_size;
+
+
+        DELETE FROM #leg2
+        WHERE [qty] <= @eps;
+
+
+        --===========================================================
+        -- 7.4. Проверка суммы корзин
+        --===========================================================
+
+        SELECT @sum_leg1 = ISNULL(SUM([qty]), 0)
+        FROM #leg1;
+
+        SELECT @sum_leg2 = ISNULL(SUM([qty]), 0)
+        FROM #leg2;
+
+
+        IF @sum_leg1 <= @eps OR @sum_leg2 <= @eps
+            BREAK;
+
+
+        IF ABS(@sum_leg1 - @trade_size) > @eps
+        BEGIN
+            THROW 51003, 'Не удалось собрать первую корзину на trade_size', 1;
+        END;
+
+
+        IF ABS(@sum_leg2 - @trade_size) > @eps
+        BEGIN
+            THROW 51004, 'Не удалось собрать вторую корзину на trade_size', 1;
+        END;
+
+
+        IF ABS(@sum_leg1 - @sum_leg2) > @eps
+        BEGIN
+            THROW 51005, 'Суммы встречных корзин не совпали', 1;
+        END;
+
+
+        --===========================================================
+        -- 7.5. Запись сделки во временный результат
+        --===========================================================
+
+        SET @deal_id = @deal_id + 1;
+
+
+        INSERT INTO #result_deals
+        (
+             [id]
+            ,[part]
+            ,[isin]
+            ,[bank_from]
+            ,[qty_from]
+            ,[bank_to]
+            ,[qty_to]
+            ,[version]
+        )
+        SELECT
+             @deal_id AS [id]
+            ,1 AS [part]
+            ,l.[isin]
+            ,l.[bank_from]
+            ,l.[qty] AS [qty_from]
+            ,l.[bank_to]
+            ,l.[qty] AS [qty_to]
+            ,@target_version AS [version]
+        FROM #leg1 l;
+
+
+        INSERT INTO #result_deals
+        (
+             [id]
+            ,[part]
+            ,[isin]
+            ,[bank_from]
+            ,[qty_from]
+            ,[bank_to]
+            ,[qty_to]
+            ,[version]
+        )
+        SELECT
+             @deal_id AS [id]
+            ,2 AS [part]
+            ,l.[isin]
+            ,l.[bank_from]
+            ,l.[qty] AS [qty_from]
+            ,l.[bank_to]
+            ,l.[qty] AS [qty_to]
+            ,@target_version AS [version]
+        FROM #leg2 l;
+
+
+        --===========================================================
+        -- 7.6. Обновление #state
+        --===========================================================
+
+        UPDATE s
+        SET s.[amount_rub] = s.[amount_rub] - l.[qty]
+        FROM #state s
+        JOIN #leg1 l
+            ON l.[bank_from] = s.[group_name]
+           AND l.[isin] = s.[isin];
+
+
+        UPDATE s
+        SET s.[amount_rub] = s.[amount_rub] + l.[qty]
+        FROM #state s
+        JOIN #leg1 l
+            ON l.[bank_to] = s.[group_name]
+           AND l.[isin] = s.[isin];
+
+
+        UPDATE s
+        SET s.[amount_rub] = s.[amount_rub] - l.[qty]
+        FROM #state s
+        JOIN #leg2 l
+            ON l.[bank_from] = s.[group_name]
+           AND l.[isin] = s.[isin];
+
+
+        UPDATE s
+        SET s.[amount_rub] = s.[amount_rub] + l.[qty]
+        FROM #state s
+        JOIN #leg2 l
+            ON l.[bank_to] = s.[group_name]
+           AND l.[isin] = s.[isin];
+
+
+        --===========================================================
+        -- 7.7. Контроль после обновления
+        --===========================================================
+
+        IF EXISTS
+        (
+            SELECT 1
+            FROM #state
+            WHERE [amount_rub] < -@eps
+        )
+        BEGIN
+            THROW 51006, 'После сделки появился отрицательный amount_rub', 1;
+        END;
+
+
+        IF EXISTS
+        (
+            SELECT 1
+            FROM #leg1 l
+            JOIN #state s
+                ON s.[group_name] = l.[bank_to]
+               AND s.[isin] = l.[isin]
+            WHERE s.[amount_rub] > s.[limit_rub] + @eps
+        )
+        BEGIN
+            THROW 51007, 'Получатель первой корзины превысил лимит', 1;
+        END;
+
+
+        IF EXISTS
+        (
+            SELECT 1
+            FROM #leg2 l
+            JOIN #state s
+                ON s.[group_name] = l.[bank_to]
+               AND s.[isin] = l.[isin]
+            WHERE s.[amount_rub] > s.[limit_rub] + @eps
+        )
+        BEGIN
+            THROW 51008, 'Получатель второй корзины превысил лимит', 1;
+        END;
+
+    END;
+
+
+    --===============================================================
+    -- 8. Финальные проверки сделок
+    --===============================================================
+
+    IF EXISTS
+    (
+        SELECT 1
+        FROM #result_deals
+        WHERE [bank_from] = [bank_to]
+    )
+    BEGIN
+        THROW 51009, 'В результате есть самосделки', 1;
+    END;
+
+
+    IF EXISTS
+    (
+        SELECT 1
+        FROM #result_deals
+        WHERE [qty_from] <= @eps
+           OR [qty_to] <= @eps
+    )
+    BEGIN
+        THROW 51010, 'В результате есть нулевые или отрицательные объемы', 1;
+    END;
+
+
+    IF EXISTS
+    (
+        SELECT 1
+        FROM #result_deals
+        WHERE ABS([qty_from] - [qty_to]) > @eps
+    )
+    BEGIN
+        THROW 51011, 'В строках сделки qty_from не равен qty_to', 1;
+    END;
+
+
+    IF EXISTS
+    (
+        SELECT
+             [id]
+        FROM #result_deals
+        GROUP BY
+             [id]
+        HAVING ABS
+        (
+            SUM(CASE WHEN [part] = 1 THEN [qty_from] ELSE 0 END)
+            -
+            SUM(CASE WHEN [part] = 2 THEN [qty_from] ELSE 0 END)
+        ) > @eps
+    )
+    BEGIN
+        THROW 51012, 'По id суммы part = 1 и part = 2 не равны', 1;
+    END;
+
+
+    IF EXISTS
+    (
+        SELECT
+             [id]
+            ,[bank_from]
+        FROM #result_deals
+        GROUP BY
+             [id]
+            ,[bank_from]
+        HAVING ABS(SUM([qty_from]) - SUM([qty_to])) > @eps
+    )
+    BEGIN
+        THROW 51013, 'Внутри сделки группа отдала не столько же, сколько получила', 1;
+    END;
+
+
+    --===============================================================
+    -- 9. Запись сделок
+    --===============================================================
+
+    DELETE FROM liquidity.tst.repo_banks_for_vla
+    WHERE [version] = @target_version;
+
+
+    INSERT INTO liquidity.tst.repo_banks_for_vla
+    (
+         [id]
+        ,[part]
+        ,[isin]
+        ,[bank_from]
+        ,[qty_from]
+        ,[bank_to]
+        ,[qty_to]
+        ,[version]
+    )
+    SELECT
+         rd.[id]
+        ,rd.[part]
+        ,rd.[isin]
+        ,rd.[bank_from]
+        ,rd.[qty_from]
+        ,rd.[bank_to]
+        ,rd.[qty_to]
+        ,rd.[version]
+    FROM #result_deals rd;
+
+
+    --===============================================================
+    -- 10. Запись итогового распределения в data_repo_for_vla
+    --
+    -- Итоговое состояние уже лежит в #state после всех сделок.
+    -- Повторно применять сделки к исходнику не надо.
+    --===============================================================
+
+    DELETE FROM liquidity.tst.data_repo_for_vla
+    WHERE [version] = @target_version;
+
+
+    INSERT INTO liquidity.tst.data_repo_for_vla
+    (
+         [dt_rep]
+        ,[isin]
+        ,[group_name]
+        ,[vol_rub]
+        ,[over_rub]
+        ,[issuesize_rub]
+        ,[version]
+    )
+    SELECT
+         CAST(@vdate AS DATETIME) AS [dt_rep]
+        ,s.[isin]
+        ,s.[group_name]
+        ,s.[amount_rub] AS [vol_rub]
+
+        ,CASE
+            WHEN s.[amount_rub] > s.[limit_rub]
+                THEN s.[amount_rub] - s.[limit_rub]
+            ELSE 0
+         END AS [over_rub]
+
+        ,s.[issuesize_rub]
+        ,@target_version AS [version]
+    FROM #state s
+    WHERE s.[amount_rub] > @eps;
+
+
+    --===============================================================
+    -- 11. Короткая диагностика результата
+    --===============================================================
+
+    SELECT
+         @target_version AS [version]
+        ,@source_version AS [source_version]
+        ,@vdate AS [dt_rep]
+        ,@iter AS [iter_cnt]
+        ,@random_pool_size AS [random_pool_size]
+        ,COUNT(DISTINCT [id]) AS [deals_cnt]
+        ,COUNT(*) AS [deal_rows_cnt]
+        ,SUM([qty_from]) AS [total_qty_from]
+    FROM #result_deals;
+
+
+    SELECT
+         @target_version AS [version]
+
+        ,SUM(
+            CASE
+                WHEN s.[amount_rub] <= s.[limit_rub]
+                    THEN s.[amount_rub]
+                ELSE 0
+            END
+         ) AS [in_vla_after]
+
+        ,SUM(
+            CASE
+                WHEN s.[amount_rub] > s.[limit_rub]
+                    THEN s.[amount_rub] - s.[limit_rub]
+                ELSE 0
+            END
+         ) AS [over_rub_after]
+
+        ,SUM(
+            CASE
+                WHEN s.[amount_rub] > s.[limit_rub]
+                    THEN 1
+                ELSE 0
+            END
+         ) AS [over_rows_after_cnt]
+
+        ,SUM(s.[amount_rub]) AS [total_amount_after]
+
+    FROM #state s
+    WHERE s.[amount_rub] > @eps;
+
+
+END;
+GO
