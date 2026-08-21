@@ -1,0 +1,87 @@
+DECLARE @source_version VARCHAR(25) = '10';
+
+DROP TABLE IF EXISTS #state_diag;
+
+SELECT
+     d.[group_name]
+    ,d.[isin]
+    ,SUM(CAST(d.[vol_rub] AS DECIMAL(38,4))) AS amount_rub
+    ,MAX(CAST(d.[issuesize_rub] AS DECIMAL(38,4))) AS issuesize_rub
+    ,MAX(CAST(d.[over_rub] AS DECIMAL(38,4))) AS over_rub
+    ,MAX(CAST(d.[issuesize_rub] AS DECIMAL(38,4))) * 0.3 AS limit_rub
+INTO #state_diag
+FROM liquidity.tst.data_repo_for_vla d WITH (NOLOCK)
+WHERE d.[version] = @source_version
+  AND d.[group_name] <> 'Прочие'
+GROUP BY
+     d.[group_name]
+    ,d.[isin];
+
+
+DROP TABLE IF EXISTS #pair_potential;
+
+SELECT
+     a.[group_name] AS group_a
+    ,b.[group_name] AS group_b
+
+    ,SUM(
+        CASE
+            WHEN a.[amount_rub] > a.[limit_rub]
+             AND b.[amount_rub] < b.[limit_rub]
+            THEN
+                CASE
+                    WHEN a.[amount_rub] - a.[limit_rub] < b.[limit_rub] - b.[amount_rub]
+                        THEN a.[amount_rub] - a.[limit_rub]
+                    ELSE b.[limit_rub] - b.[amount_rub]
+                END
+            ELSE 0
+        END
+     ) AS can_a_to_b
+
+    ,SUM(
+        CASE
+            WHEN b.[amount_rub] > b.[limit_rub]
+             AND a.[amount_rub] < a.[limit_rub]
+            THEN
+                CASE
+                    WHEN b.[amount_rub] - b.[limit_rub] < a.[limit_rub] - a.[amount_rub]
+                        THEN b.[amount_rub] - b.[limit_rub]
+                    ELSE a.[limit_rub] - a.[amount_rub]
+                END
+            ELSE 0
+        END
+     ) AS can_b_to_a
+
+INTO #pair_potential
+FROM #state_diag a
+JOIN #state_diag b
+    ON a.[isin] = b.[isin]
+   AND a.[group_name] < b.[group_name]
+GROUP BY
+     a.[group_name]
+    ,b.[group_name];
+
+
+SELECT
+     @source_version AS [version]
+    ,COUNT(*) AS pairs_cnt
+    ,SUM(CASE WHEN can_a_to_b > 0 THEN 1 ELSE 0 END) AS pairs_with_a_to_b
+    ,SUM(CASE WHEN can_b_to_a > 0 THEN 1 ELSE 0 END) AS pairs_with_b_to_a
+    ,SUM(CASE WHEN can_a_to_b > 0 AND can_b_to_a > 0 THEN 1 ELSE 0 END) AS mutual_pairs_cnt
+    ,SUM(can_a_to_b) AS total_can_a_to_b
+    ,SUM(can_b_to_a) AS total_can_b_to_a
+    ,SUM(
+        CASE
+            WHEN can_a_to_b > 0 AND can_b_to_a > 0
+            THEN CASE WHEN can_a_to_b < can_b_to_a THEN can_a_to_b ELSE can_b_to_a END
+            ELSE 0
+        END
+     ) AS total_mutual_trade_size
+    ,MAX(
+        CASE
+            WHEN can_a_to_b > 0 AND can_b_to_a > 0
+            THEN CASE WHEN can_a_to_b < can_b_to_a THEN can_a_to_b ELSE can_b_to_a END
+            ELSE 0
+        END
+     ) AS max_pair_trade_size
+FROM #pair_potential;
