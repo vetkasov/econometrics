@@ -1,0 +1,242 @@
+USE [LIQUIDITY]
+GO
+
+DECLARE
+     @from_version VARCHAR(25)   = '3'
+    ,@to_version   VARCHAR(25)   = '10'
+    ,@dt_rep       DATE          = '20260507'
+    ,@split_size   DECIMAL(38,4) = 10000000000; -- размер одной части выпуска, например 10 млрд
+
+
+--=========================================================
+-- 1. Исходные строки
+-- Агрегируем на случай дублей по isin + group_name
+--=========================================================
+
+DROP TABLE IF EXISTS #src;
+
+SELECT
+     MAX(d.[dt_rep]) AS [dt_rep]
+    ,d.[isin]
+    ,d.[group_name]
+    ,SUM(CAST(d.[vol_rub] AS DECIMAL(38,4))) AS [vol_rub]
+    ,MAX(CAST(d.[issuesize_rub] AS DECIMAL(38,4))) AS [issuesize_rub]
+INTO #src
+FROM liquidity.tst.data_repo_for_vla d WITH (NOLOCK)
+WHERE d.[version] = @from_version
+  AND d.[group_name] <> 'Прочие'
+GROUP BY
+     d.[isin]
+    ,d.[group_name];
+
+
+--=========================================================
+-- 2. Генерируем номера частей
+--=========================================================
+
+DECLARE @max_parts INT;
+
+SELECT
+    @max_parts = MAX(CAST(CEILING([issuesize_rub] / @split_size) AS INT))
+FROM #src;
+
+
+DROP TABLE IF EXISTS #nums;
+
+;WITH nums AS
+(
+    SELECT 1 AS n
+
+    UNION ALL
+
+    SELECT n + 1
+    FROM nums
+    WHERE n < @max_parts
+)
+SELECT n
+INTO #nums
+FROM nums
+OPTION (MAXRECURSION 0);
+
+
+--=========================================================
+-- 3. Дробим выпуск на части
+--=========================================================
+
+DROP TABLE IF EXISTS #split_base;
+
+SELECT
+     s.[dt_rep]
+    ,s.[isin] AS [base_isin]
+
+    ,CASE
+        WHEN s.[issuesize_rub] <= @split_size
+            THEN s.[isin]
+        ELSE CAST(s.[isin] AS VARCHAR(255)) + '_' + CAST(n.[n] AS VARCHAR(10))
+     END AS [isin]
+
+    ,s.[group_name]
+    ,n.[n] AS [part_num]
+    ,s.[vol_rub] AS [source_vol_rub]
+    ,s.[issuesize_rub] AS [source_issuesize_rub]
+
+    ,CASE
+        WHEN s.[issuesize_rub] <= @split_size
+            THEN s.[issuesize_rub]
+
+        WHEN s.[issuesize_rub] - @split_size * (n.[n] - 1) >= @split_size
+            THEN @split_size
+
+        ELSE s.[issuesize_rub] - @split_size * (n.[n] - 1)
+     END AS [part_issuesize_rub]
+
+INTO #split_base
+FROM #src s
+
+JOIN #nums n
+    ON n.[n] <= CEILING(s.[issuesize_rub] / @split_size);
+
+
+--=========================================================
+-- 4. Пропорционально распределяем vol_rub по частям выпуска
+--=========================================================
+
+DROP TABLE IF EXISTS #split_with_amount;
+
+SELECT
+     sb.[dt_rep]
+    ,sb.[base_isin]
+    ,sb.[isin]
+    ,sb.[group_name]
+    ,sb.[part_num]
+    ,sb.[source_vol_rub]
+    ,sb.[source_issuesize_rub]
+    ,sb.[part_issuesize_rub]
+
+    ,sb.[source_vol_rub]
+        * sb.[part_issuesize_rub]
+        / NULLIF(sb.[source_issuesize_rub], 0) AS [vol_rub]
+
+INTO #split_with_amount
+FROM #split_base sb;
+
+
+--=========================================================
+-- 5. Считаем лимит для каждой части
+-- Для искусственных ISIN дату выпуска берем по base_isin
+--=========================================================
+
+DROP TABLE IF EXISTS #isin_limits;
+
+;WITH split_isins AS
+(
+    SELECT
+         swa.[isin]
+        ,swa.[base_isin]
+        ,MAX(swa.[part_issuesize_rub]) AS [issuesize_rub]
+        ,MAX(swa.[dt_rep]) AS [fallback_dt_release]
+    FROM #split_with_amount swa
+    GROUP BY
+         swa.[isin]
+        ,swa.[base_isin]
+),
+security_with_release AS
+(
+    SELECT
+         si.[isin]
+        ,si.[base_isin]
+        ,si.[issuesize_rub]
+        ,ISNULL(sec.[startdate], si.[fallback_dt_release]) AS [dt_release]
+    FROM split_isins si
+
+    OUTER APPLY
+    (
+        SELECT
+            MAX(sc.[startdate]) AS [startdate]
+        FROM [TradingDW].[dbo].[Security] sc WITH (NOLOCK)
+        WHERE sc.[isin] = si.[base_isin]
+    ) sec
+)
+
+SELECT
+     sr.[isin]
+    ,sr.[base_isin]
+    ,sr.[issuesize_rub]
+    ,MAX(lim.[limit]) AS [limit_share]
+    ,sr.[issuesize_rub] * MAX(lim.[limit]) AS [limit_rub]
+
+INTO #isin_limits
+
+FROM security_with_release sr
+
+LEFT JOIN [LIQUIDITY].[tst].[repo_banks_for_vla_limits] lim WITH (NOLOCK)
+    ON @dt_rep >= lim.[dt_from]
+   AND @dt_rep <= ISNULL(lim.[dt_to], CAST('44440101' AS DATE))
+   AND sr.[dt_release] >= ISNULL(lim.[dt_from_release], CAST('19000101' AS DATE))
+   AND sr.[dt_release] <= ISNULL(lim.[dt_to_release], CAST('44440101' AS DATE))
+
+GROUP BY
+     sr.[isin]
+    ,sr.[base_isin]
+    ,sr.[issuesize_rub];
+
+
+--=========================================================
+-- 6. Финальный результат во временной таблице
+-- over_rub считаем заново после дробления
+--=========================================================
+
+DROP TABLE IF EXISTS #split_result;
+
+SELECT
+     swa.[dt_rep]
+    ,swa.[isin]
+    ,swa.[group_name]
+    ,swa.[vol_rub]
+
+    ,CASE
+        WHEN swa.[vol_rub] > lim.[limit_rub]
+            THEN swa.[vol_rub] - lim.[limit_rub]
+        ELSE 0
+     END AS [over_rub]
+
+    ,swa.[part_issuesize_rub] AS [issuesize_rub]
+    ,@to_version AS [version]
+
+    -- технические поля для проверки
+    ,swa.[base_isin]
+    ,swa.[part_num]
+    ,lim.[limit_share]
+    ,lim.[limit_rub]
+
+INTO #split_result
+
+FROM #split_with_amount swa
+
+JOIN #isin_limits lim
+    ON lim.[isin] = swa.[isin]
+
+WHERE swa.[vol_rub] > 0;
+
+
+--=========================================================
+-- 7. Смотрим результат
+--=========================================================
+
+SELECT
+     [dt_rep]
+    ,[isin]
+    ,[group_name]
+    ,[vol_rub]
+    ,[over_rub]
+    ,[issuesize_rub]
+    ,[version]
+    ,[base_isin]
+    ,[part_num]
+    ,[limit_share]
+    ,[limit_rub]
+FROM #split_result
+ORDER BY
+     [base_isin]
+    ,[group_name]
+    ,[part_num];
