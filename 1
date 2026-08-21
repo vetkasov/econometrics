@@ -1,0 +1,178 @@
+USE [LIQUIDITY]
+GO
+
+
+ALTER PROCEDURE [tst].[prc_repo_banks_for_vla_nw_v4]
+(
+     @source_version      VARCHAR(25)    = '40'
+    ,@target_version      VARCHAR(25)    = 'v4_1'
+    ,@vdate               DATE           = NULL
+    ,@max_iter            INT            = 10000
+    ,@random_pool_size    INT            = 5
+    ,@eps                 DECIMAL(38,4)  = 1
+)
+AS
+BEGIN
+
+    SET NOCOUNT ON;
+
+
+    IF @vdate IS NULL
+    BEGIN
+        SELECT
+            @vdate = MAX([dt_rep])
+        FROM liquidity.tst.data_repo_for_vla WITH (NOLOCK)
+        WHERE [version] = @source_version;
+    END;
+
+
+    IF @random_pool_size IS NULL OR @random_pool_size < 1
+        SET @random_pool_size = 1;
+
+
+    --===============================================================
+    -- 1. Исходные данные
+    --===============================================================
+
+    DROP TABLE IF EXISTS #data_holders;
+
+    SELECT
+         d.[dt_rep]
+        ,CAST(d.[isin] AS VARCHAR(255)) AS [isin]
+        ,d.[group_name]
+        ,CAST(d.[vol_rub] AS DECIMAL(38,4)) AS [vol_rub]
+        ,CAST(d.[over_rub] AS DECIMAL(38,4)) AS [over_rub]
+        ,CAST(d.[issuesize_rub] AS DECIMAL(38,4)) AS [issuesize_rub]
+        ,d.[version]
+    INTO #data_holders
+    FROM liquidity.tst.data_repo_for_vla d WITH (NOLOCK)
+    WHERE d.[version] = @source_version
+      AND d.[group_name] <> 'Прочие';
+
+
+    --===============================================================
+    -- 2. Агрегируем исходник до group_name + isin
+    --===============================================================
+
+    DROP TABLE IF EXISTS #raw_holders;
+
+    SELECT
+         dh.[isin]
+        ,dh.[group_name]
+        ,SUM(dh.[vol_rub]) AS [amount_rub]
+        ,MAX(dh.[issuesize_rub]) AS [issuesize_rub]
+        ,MAX(dh.[dt_rep]) AS [dt_rep]
+    INTO #raw_holders
+    FROM #data_holders dh
+    GROUP BY
+         dh.[isin]
+        ,dh.[group_name];
+
+
+    CREATE INDEX ix_raw_holders
+    ON #raw_holders ([group_name], [isin]);
+
+
+    --===============================================================
+    -- 3. Список групп
+    --===============================================================
+
+    DROP TABLE IF EXISTS #groups;
+
+    SELECT DISTINCT
+        rh.[group_name]
+    INTO #groups
+    FROM #raw_holders rh;
+
+
+    CREATE UNIQUE CLUSTERED INDEX ix_groups
+    ON #groups ([group_name]);
+
+
+    --===============================================================
+    -- 4. Список ISIN и лимиты
+    --
+    -- Для искусственных ISIN типа XXX_1, XXX_2 дату выпуска берем
+    -- по базовому ISIN без суффикса.
+    --===============================================================
+
+    DROP TABLE IF EXISTS #isins;
+
+    ;WITH source_isins AS
+    (
+        SELECT
+             rh.[isin]
+
+            ,CASE
+                WHEN CHARINDEX('_', rh.[isin]) > 0
+                    THEN LEFT(rh.[isin], CHARINDEX('_', rh.[isin]) - 1)
+                ELSE rh.[isin]
+             END AS [base_isin]
+
+            ,MAX(rh.[issuesize_rub]) AS [issuesize_rub]
+            ,MAX(rh.[dt_rep]) AS [fallback_dt_release]
+        FROM #raw_holders rh
+        GROUP BY
+             rh.[isin]
+            ,CASE
+                WHEN CHARINDEX('_', rh.[isin]) > 0
+                    THEN LEFT(rh.[isin], CHARINDEX('_', rh.[isin]) - 1)
+                ELSE rh.[isin]
+             END
+    ),
+    security_with_release AS
+    (
+        SELECT
+             si.[isin]
+            ,si.[base_isin]
+            ,si.[issuesize_rub]
+            ,ISNULL(sec.[startdate], si.[fallback_dt_release]) AS [dt_release]
+        FROM source_isins si
+
+        OUTER APPLY
+        (
+            SELECT
+                MAX(sc.[startdate]) AS [startdate]
+            FROM [TradingDW].[dbo].[Security] sc WITH (NOLOCK)
+            WHERE sc.[isin] = si.[base_isin]
+        ) sec
+    )
+    SELECT
+         sr.[isin]
+        ,sr.[base_isin]
+        ,sr.[issuesize_rub]
+        ,sr.[dt_release]
+        ,MAX(lim.[limit]) AS [limit_share]
+        ,sr.[issuesize_rub] * MAX(lim.[limit]) AS [limit_rub]
+    INTO #isins
+    FROM security_with_release sr
+
+    LEFT JOIN [LIQUIDITY].[tst].[repo_banks_for_vla_limits] lim WITH (NOLOCK)
+        ON @vdate >= lim.[dt_from]
+       AND @vdate <= ISNULL(lim.[dt_to], CAST('44440101' AS DATE))
+       AND sr.[dt_release] >= ISNULL(lim.[dt_from_release], CAST('19000101' AS DATE))
+       AND sr.[dt_release] <= ISNULL(lim.[dt_to_release], CAST('44440101' AS DATE))
+
+    GROUP BY
+         sr.[isin]
+        ,sr.[base_isin]
+        ,sr.[issuesize_rub]
+        ,sr.[dt_release];
+
+
+    IF EXISTS
+    (
+        SELECT 1
+        FROM #isins
+        WHERE [limit_rub] IS NULL
+    )
+    BEGIN
+        THROW 51001, 'Для части ISIN не найден лимит в repo_banks_for_vla_limits', 1;
+    END;
+
+
+    CREATE UNIQUE CLUSTERED INDEX ix_isins
+    ON #isins ([isin]);
+
+
+   
